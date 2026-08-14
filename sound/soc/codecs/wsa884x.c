@@ -415,6 +415,7 @@
 #define WSA884X_DRE_CTL_1_CSR_GAIN_SHIFT		1
 #define WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK		0x01
 #define WSA884X_DRE_CTL_1_CSR_GAIN_EN_SHIFT		0
+#define WSA884X_DRE_CTL_1_CSR_GAIN_EN_ENABLE		0x1
 #define WSA884X_DRE_IDLE_DET_CTL	(WSA884X_DIG_CTRL0_BASE + 0xb2)
 #define WSA884X_GAIN_RAMPING_CTL	(WSA884X_DIG_CTRL0_BASE + 0xb8)
 #define WSA884X_GAIN_RAMPING_MIN	(WSA884X_DIG_CTRL0_BASE + 0xb9)
@@ -471,13 +472,21 @@
 #define WSA884X_ANA_WO_CTL_0		(WSA884X_DIG_CTRL1_BASE + 0x04)
 #define WSA884X_ANA_WO_CTL_0_MODE_SHIFT		0
 #define WSA884X_ANA_WO_CTL_0_VPHX_SYS_EN_MASK			0xc0
+#define WSA884X_ANA_WO_CTL_0_VPHX_SYS_EN_SHIFT			6
 #define WSA884X_ANA_WO_CTL_0_PA_AUX_DISABLE			0x0
 #define WSA884X_ANA_WO_CTL_0_PA_AUX_18_DB			0xa
 #define WSA884X_ANA_WO_CTL_0_PA_AUX_0_DB			0x7
 #define WSA884X_ANA_WO_CTL_0_PA_AUX_GAIN_MASK			0x3c
+#define WSA884X_ANA_WO_CTL_0_PA_AUX_GAIN_SHIFT			2
 #define WSA884X_ANA_WO_CTL_0_PA_MIN_GAIN_BYP_MASK		0x02
 #define WSA884X_ANA_WO_CTL_0_DAC_CM_CLAMP_EN_MODE_SPEAKER	0x1
 #define WSA884X_ANA_WO_CTL_0_DAC_CM_CLAMP_EN_MASK		0x01
+
+#define WSA884X_ANA_WO_CTL_0_VPHX_EXT_VDDSPK		0x3
+#define WSA884X_ANA_WO_CTL_0_PA_AUX_12_DB		0x8
+#define WSA884X_ANA_WO_CTL_1_EXT_ABOVE_3S_MASK		BIT(2)
+#define WSA884X_ANA_WO_CTL_1_EXT_ABOVE_3S		BIT(2)
+
 #define WSA884X_ANA_WO_CTL_1		(WSA884X_DIG_CTRL1_BASE + 0x05)
 #define WSA884X_PIN_CTL			(WSA884X_DIG_CTRL1_BASE + 0x10)
 #define WSA884X_PIN_CTL_OE		(WSA884X_DIG_CTRL1_BASE + 0x11)
@@ -747,6 +756,7 @@ struct wsa884x_priv {
 	struct mutex sp_lock;
 	unsigned int temperature;
 	bool pa_on;
+	bool ext_vdd_spkr;
 };
 
 enum {
@@ -1457,11 +1467,31 @@ static const struct reg_sequence wsa884x_reg_init[] = {
 	{ WSA884X_OTP_REG_40, FIELD_PREP_CONST(WSA884X_OTP_REG_40_ISENSE_RESCAL_MASK, 0x8) },
 };
 
+/*
+ * wsa884x_set_gain_parameters - configure gain, isense, vsense and DRE.
+ *
+ * For INTERNAL boost the compander port controls DRE:
+ *   - comp port enabled  => DRE_CTL_1 CSR_GAIN_EN=0 (gain from SoundWire)
+ *   - comp port disabled => DRE_CTL_1 CSR_GAIN_EN=1 (gain from CSR register)
+ *
+ * For EXTERNAL VDD / 4S mode (ext_vdd_spkr=true):
+ *   - DRE (compander) MUST be disabled: CSR_GAIN_EN=1 unconditionally.
+ *   - PA gain is fixed at +21 dB (CSR gain code = 0x0).
+ *   - PA_AUX_GAIN = 12 dB, VPHX_SYS_EN = EXT_VDDSPK in ANA_WO_CTL_0.
+ *   - EXT_ABOVE_3S flag set in ANA_WO_CTL_1.
+ *   - min_gain = G_12_DB (matches PA_AUX_GAIN = 12 dB lower boundary).
+ *   - vsense = VSENSE_M24_DB (Bolaro wsa_update_vsense @21 dB).
+ *   - isense: skipped (Bolaro wsa_update_isense skips at 21 dB).
+ *   - CLSH disabled (not used in external boost mode).
+ * This mirrors Bolaro kundu_register_configuration() WSA_BOOST_EXTERNAL branch.
+ */
+
 static void wsa884x_set_gain_parameters(struct wsa884x_priv *wsa884x)
 {
 	struct regmap *regmap = wsa884x->regmap;
 	unsigned int min_gain, igain, vgain, comp_offset;
 
+	printk("wsa884x_set_gain_parameters louis wsa884x->dev_mode: %d, external vdd mode (%d)\n", wsa884x->dev_mode, wsa884x->ext_vdd_spkr);
 	/*
 	 * Downstream sets gain parameters customized per boards per use-case.
 	 * Choose here some sane values matching knowon users, like QRD8550
@@ -1471,7 +1501,49 @@ static void wsa884x_set_gain_parameters(struct wsa884x_priv *wsa884x)
 	 * For WSA884X_RECEIVER - G_7P5_DB system gain
 	 * For WSA884X_SPEAKER - G_21_DB system gain
 	 */
-	if (wsa884x->dev_mode == WSA884X_RECEIVER) {
+	if (wsa884x->ext_vdd_spkr) {
+		/*
+		 * External VDD / 4S battery mode:
+		 * Disable DRE: CSR_GAIN_EN=1 (GAIN_FROM_CSR), CSR_GAIN=0 (+21 dB).
+		 */
+		regmap_update_bits(regmap, WSA884X_DRE_CTL_1,
+				   WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK |
+				   WSA884X_DRE_CTL_1_CSR_GAIN_MASK,
+				   FIELD_PREP(WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_ENABLE) |
+				   FIELD_PREP(WSA884X_DRE_CTL_1_CSR_GAIN_MASK, 0x0));
+		/* vsense: -24 dB for +21 dB PA gain (isense skipped) */
+		regmap_update_bits(regmap, WSA884X_VSENSE1,
+				   WSA884X_VSENSE1_GAIN_VSENSE_FE_MASK,
+				   FIELD_PREP(WSA884X_VSENSE1_GAIN_VSENSE_FE_MASK,
+					      VSENSE_M24_DB));
+		/* min_gain: G_12_DB for EXT_ABOVE_3S lower boundary */
+		regmap_update_bits(regmap, WSA884X_GAIN_RAMPING_MIN,
+				   WSA884X_GAIN_RAMPING_MIN_MIN_GAIN_MASK,
+				   FIELD_PREP(WSA884X_GAIN_RAMPING_MIN_MIN_GAIN_MASK,
+					      G_12_DB));
+		/*
+		 * ANA_WO_CTL_0: PA_AUX_GAIN=12 dB, VPHX_SYS_EN=EXT_VDDSPK.
+		 * Mirrors Bolaro ana_wo_ctl_0 for CDC_ACDB_VAL_HW_CFG_EXT_ABOVE_3S.
+		 */
+		regmap_update_bits(regmap, WSA884X_ANA_WO_CTL_0,
+				   WSA884X_ANA_WO_CTL_0_VPHX_SYS_EN_MASK |
+				   WSA884X_ANA_WO_CTL_0_PA_AUX_GAIN_MASK,
+				   FIELD_PREP(WSA884X_ANA_WO_CTL_0_VPHX_SYS_EN_MASK,
+					      WSA884X_ANA_WO_CTL_0_VPHX_EXT_VDDSPK) |
+				   FIELD_PREP(WSA884X_ANA_WO_CTL_0_PA_AUX_GAIN_MASK,
+					      WSA884X_ANA_WO_CTL_0_PA_AUX_12_DB));
+		/*
+		 * ANA_WO_CTL_1: set EXT_ABOVE_3S flag.
+		 * Mirrors Bolaro: ana_wo_ctl_1 |= EXT_ABOVE_3S.
+		 */
+		regmap_update_bits(regmap, WSA884X_ANA_WO_CTL_1,
+				   WSA884X_ANA_WO_CTL_1_EXT_ABOVE_3S_MASK,
+				   WSA884X_ANA_WO_CTL_1_EXT_ABOVE_3S);
+		/* CLSH is not enabled in external boost mode */
+		regmap_write(regmap, WSA884X_CLSH_CTL_0, 0x00);
+		return;
+	} else if (wsa884x->dev_mode == WSA884X_RECEIVER) {
 		comp_offset = COMP_OFFSET4;
 		min_gain = G_M6_DB;
 		igain = ISENSE_18_DB;
@@ -1513,6 +1585,7 @@ static void wsa884x_init(struct wsa884x_priv *wsa884x)
 {
 	unsigned int wo_ctl_0;
 	unsigned int variant = 0;
+	printk("louis wsa884x_init +. external vdd mode (%d)\n", wsa884x->ext_vdd_spkr);
 
 	if (!regmap_read(wsa884x->regmap, WSA884X_OTP_REG_0, &variant))
 		variant = variant & WSA884X_OTP_REG_0_ID_MASK;
@@ -1523,18 +1596,34 @@ static void wsa884x_init(struct wsa884x_priv *wsa884x)
 	wo_ctl_0 = 0xc;
 	wo_ctl_0 |= FIELD_PREP(WSA884X_ANA_WO_CTL_0_DAC_CM_CLAMP_EN_MASK,
 			       WSA884X_ANA_WO_CTL_0_DAC_CM_CLAMP_EN_MODE_SPEAKER);
-	/* Assume that compander is enabled by default unless it is haptics sku */
-	if (variant == WSA884X_OTP_ID_WSA8845H)
+
+	/*
+	 * Choose ANA_WO_CTL_0 PA_AUX_GAIN and VPHX_SYS_EN per mode.
+	 * wsa884x_set_gain_parameters() completes the full configuration.
+	 */
+	if (wsa884x->ext_vdd_spkr) {
+		/*
+		 * External VDD / 4S battery: VPHX_SYS_EN=EXT_VDDSPK, PA_AUX_GAIN=12 dB.
+		 */
+		wo_ctl_0 &= ~(WSA884X_ANA_WO_CTL_0_VPHX_SYS_EN_MASK |
+			      WSA884X_ANA_WO_CTL_0_PA_AUX_GAIN_MASK);
+		wo_ctl_0 |= FIELD_PREP(WSA884X_ANA_WO_CTL_0_VPHX_SYS_EN_MASK,
+				       WSA884X_ANA_WO_CTL_0_VPHX_EXT_VDDSPK) |
+			    FIELD_PREP(WSA884X_ANA_WO_CTL_0_PA_AUX_GAIN_MASK,
+				       WSA884X_ANA_WO_CTL_0_PA_AUX_12_DB);
+	} else if (variant == WSA884X_OTP_ID_WSA8845H) {
 		wo_ctl_0 |= FIELD_PREP(WSA884X_ANA_WO_CTL_0_PA_AUX_GAIN_MASK,
 				       WSA884X_ANA_WO_CTL_0_PA_AUX_18_DB);
-	else
+	} else {
 		wo_ctl_0 |= FIELD_PREP(WSA884X_ANA_WO_CTL_0_PA_AUX_GAIN_MASK,
 				       WSA884X_ANA_WO_CTL_0_PA_AUX_0_DB);
+	}
 	regmap_write(wsa884x->regmap, WSA884X_ANA_WO_CTL_0, wo_ctl_0);
 
 	wsa884x_set_gain_parameters(wsa884x);
 
 	wsa884x->hw_init = true;
+	printk("louis wsa884x_init -. \n");
 }
 
 static int wsa884x_update_status(struct sdw_slave *slave,
@@ -1804,19 +1893,24 @@ static int wsa884x_hw_free(struct snd_pcm_substream *substream,
 static int wsa884x_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 {
 	struct snd_soc_component *component = dai->component;
+	struct wsa884x_priv *wsa884x = snd_soc_component_get_drvdata(component);
 
 	if (mute) {
-		snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
-					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
-					      0x0);
+		if (!wsa884x->ext_vdd_spkr)
+			snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
+						      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+						      0x0);
+
 		snd_soc_component_write_field(component, WSA884X_PA_FSM_EN,
 					      WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK,
 					      0x0);
 
 	} else {
-		snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
-					      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
-					      0x1);
+		if (!wsa884x->ext_vdd_spkr)
+			snd_soc_component_write_field(component, WSA884X_DRE_CTL_1,
+						      WSA884X_DRE_CTL_1_CSR_GAIN_EN_MASK,
+						      0x1);
+
 		snd_soc_component_write_field(component, WSA884X_PA_FSM_EN,
 					      WSA884X_PA_FSM_EN_GLOBAL_PA_EN_MASK,
 					      0x1);
@@ -2083,6 +2177,11 @@ static int wsa884x_probe(struct sdw_slave *pdev,
 	wsa884x->sconfig.bps = 1;
 	wsa884x->sconfig.direction = SDW_DATA_DIR_RX;
 	wsa884x->sconfig.type = SDW_STREAM_PDM;
+
+	wsa884x->ext_vdd_spkr = of_property_read_bool(dev->of_node,
+						      "qcom,ext-vdd-spkr");
+	if (wsa884x->ext_vdd_spkr)
+		dev_dbg(dev, "External VDD speaker mode enabled\n");
 
 	/*
 	 * Port map index starts with 0, however the data port for this codec
