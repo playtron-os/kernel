@@ -317,6 +317,9 @@ static u32 msm_dp_panel_get_supported_bpp(struct msm_dp_panel *msm_dp_panel,
 	link_info = &msm_dp_panel->link_info;
 	data_rate_khz = link_info->num_lanes * link_info->rate * 8;
 
+	if (!data_rate_khz)
+		return bpp;
+
 	do {
 		if (mode_pclk_khz * bpp <= data_rate_khz)
 			return bpp;
