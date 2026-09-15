@@ -242,6 +242,8 @@ struct fastrpc_map {
 	struct fastrpc_user *fl;
 	int fd;
 	struct dma_buf *buf;
+	/* Set while this map owns the reference taken by dma_buf_get(). */
+	bool buf_owned;
 	struct sg_table *table;
 	struct dma_buf_attachment *attach;
 	dma_addr_t dma_addr;
@@ -397,13 +399,11 @@ static void fastrpc_free_map(struct kref *ref)
 	map = container_of(ref, struct fastrpc_map, refcount);
 
 	fl = map->fl;
-	if (!fl)
-		return;
 
-	if (map->table) {
+	if (fl && map->table) {
 		if (map->attr & FASTRPC_ATTR_SECUREMAP) {
 			struct qcom_scm_vmperm perm;
-			int vmid = map->fl->cctx->vmperms[0].vmid;
+			int vmid = fl->cctx->vmperms[0].vmid;
 			u64 src_perms = BIT(QCOM_SCM_VMID_HLOS) | BIT(vmid);
 			int err = 0;
 
@@ -411,29 +411,37 @@ static void fastrpc_free_map(struct kref *ref)
 			perm.perm = QCOM_SCM_PERM_RWX;
 			err = qcom_scm_assign_mem(map->dma_addr, map->len,
 				&src_perms, &perm, 1);
-			if (err) {
-				dev_err(map->fl->sctx->dev,
+			if (err)
+				dev_err(fl->sctx->dev,
 					"Failed to assign memory dma_addr %pad size 0x%llx err %d\n",
 					&map->dma_addr, map->len, err);
-				return;
-			}
 		}
+
+		/*
+		 * Unmapping and detaching both act on the session device, so
+		 * they are only possible while it is still bound. After a
+		 * subsystem restart it is gone and the attachment has to be
+		 * abandoned -- but the buffer reference below must still be
+		 * dropped, or the buffer's pages stay allocated until reboot.
+		 */
 		mutex_lock(&fl->sctx->mutex);
-		if (!fl->sctx->dev) {
-			mutex_unlock(&fl->sctx->mutex);
-			return;
+		if (fl->sctx->dev) {
+			dma_buf_unmap_attachment_unlocked(map->attach, map->table,
+							  DMA_BIDIRECTIONAL);
+			dma_buf_detach(map->buf, map->attach);
 		}
-		dma_buf_unmap_attachment_unlocked(map->attach, map->table,
-						  DMA_BIDIRECTIONAL);
-		dma_buf_detach(map->buf, map->attach);
-		dma_buf_put(map->buf);
 		mutex_unlock(&fl->sctx->mutex);
 	}
 
-	if (map->fl) {
-		spin_lock(&map->fl->lock);
+	if (map->buf_owned) {
+		dma_buf_put(map->buf);
+		map->buf_owned = false;
+	}
+
+	if (fl) {
+		spin_lock(&fl->lock);
 		list_del(&map->node);
-		spin_unlock(&map->fl->lock);
+		spin_unlock(&fl->lock);
 		map->fl = NULL;
 	}
 
@@ -593,21 +601,16 @@ static void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx)
 	kref_put(&cctx->refcount, fastrpc_channel_ctx_free);
 }
 
-static void fastrpc_context_put(struct fastrpc_invoke_ctx *ctx);
+static void fastrpc_session_free(struct fastrpc_channel_ctx *cctx,
+				 struct fastrpc_session_ctx *session);
 
 static void fastrpc_user_free(struct kref *ref)
 {
 	struct fastrpc_user *fl = container_of(ref, struct fastrpc_user, refcount);
-	struct fastrpc_invoke_ctx *ctx, *n;
 	struct fastrpc_map *map, *m;
 	struct fastrpc_buf *buf, *b;
 
 	fastrpc_buf_free(fl->init_mem);
-
-	list_for_each_entry_safe(ctx, n, &fl->pending, node) {
-		list_del(&ctx->node);
-		fastrpc_context_put(ctx);
-	}
 
 	list_for_each_entry_safe(map, m, &fl->maps, node)
 		fastrpc_map_put(map);
@@ -617,6 +620,7 @@ static void fastrpc_user_free(struct kref *ref)
 		fastrpc_buf_free(buf);
 	}
 
+	fastrpc_session_free(fl->cctx, fl->sctx);
 	fastrpc_channel_ctx_put(fl->cctx);
 	mutex_destroy(&fl->mutex);
 	kfree(fl);
@@ -946,6 +950,7 @@ static int fastrpc_map_attach(struct fastrpc_user *fl, int fd,
 		err = PTR_ERR(map->buf);
 		goto get_err;
 	}
+	map->buf_owned = true;
 
 	mutex_lock(&fl->sctx->mutex);
 	if (!fl->sctx->dev) {
@@ -1016,8 +1021,10 @@ static int fastrpc_map_attach(struct fastrpc_user *fl, int fd,
 
 map_err:
 	dma_buf_detach(map->buf, map->attach);
+	map->table = NULL;
 attach_err:
 	dma_buf_put(map->buf);
+	map->buf_owned = false;
 get_err:
 	fastrpc_map_put(map);
 
@@ -1125,7 +1132,6 @@ static int fastrpc_flush_args(struct fastrpc_invoke_ctx *ctx,
 	union fastrpc_remote_arg *rpra)
 {
 	int oix, inbufs, outbufs;
-	struct device *dev = ctx->fl->sctx->dev;
 
 	inbufs = REMOTE_SCALARS_INBUFS(ctx->sc);
 	outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
@@ -1155,7 +1161,6 @@ static int fastrpc_inv_args(struct fastrpc_invoke_ctx *ctx)
 	int i, inbufs, outbufs;
 	uint32_t sc = ctx->sc;
 	union fastrpc_remote_arg *rpra = ctx->rpra;
-	struct device *dev = ctx->fl->sctx->dev;
 
 	inbufs = REMOTE_SCALARS_INBUFS(sc);
 	outbufs = REMOTE_SCALARS_OUTBUFS(sc);
@@ -1845,15 +1850,29 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 {
 	struct fastrpc_user *fl = (struct fastrpc_user *)file->private_data;
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	struct fastrpc_invoke_ctx *ctx, *next;
+	LIST_HEAD(pending);
 	unsigned long flags;
 
 	fastrpc_release_current_dsp_process(fl);
+
+	/*
+	 * Interrupted callers retain a context reference, and each context holds
+	 * fl alive. Break that cycle on close. Remote references still protect
+	 * in-flight buffers; maps and the session are freed only by user_free.
+	 */
+	spin_lock(&fl->lock);
+	list_splice_init(&fl->pending, &pending);
+	spin_unlock(&fl->lock);
+	list_for_each_entry_safe(ctx, next, &pending, node) {
+		list_del(&ctx->node);
+		fastrpc_context_put(ctx);
+	}
 
 	spin_lock_irqsave(&cctx->lock, flags);
 	list_del(&fl->user);
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
-	fastrpc_session_free(cctx, fl->sctx);
 	file->private_data = NULL;
 	/* Release the reference taken in fastrpc_device_open */
 	fastrpc_user_put(fl);
@@ -2319,13 +2338,17 @@ static int fastrpc_req_mem_unmap_impl(struct fastrpc_user *fl, struct fastrpc_me
 	sc = FASTRPC_SCALARS(FASTRPC_RMID_INIT_MEM_UNMAP, 1, 0);
 	err = fastrpc_internal_invoke(fl, true, FASTRPC_INIT_HANDLE, sc,
 				      &args[0]);
-	if (err) {
+	if (err)
 		dev_err(dev, "unmmap\tpt fd = %d, 0x%09llx error\n",  map->fd, map->raddr);
-		return err;
-	}
+
+	/*
+	 * Release the map whether or not the DSP acknowledged the unmap: if it
+	 * did not, the session is gone and keeping the mapping only strands
+	 * its pages.
+	 */
 	fastrpc_map_put(map);
 
-	return 0;
+	return err;
 }
 
 static int fastrpc_req_mem_unmap(struct fastrpc_user *fl, char __user *argp)
