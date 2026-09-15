@@ -1126,7 +1126,6 @@ static int fastrpc_flush_args(struct fastrpc_invoke_ctx *ctx,
 	union fastrpc_remote_arg *rpra)
 {
 	int oix, inbufs, outbufs;
-	struct device *dev = ctx->fl->sctx->dev;
 
 	inbufs = REMOTE_SCALARS_INBUFS(ctx->sc);
 	outbufs = REMOTE_SCALARS_OUTBUFS(ctx->sc);
@@ -1156,7 +1155,6 @@ static int fastrpc_inv_args(struct fastrpc_invoke_ctx *ctx)
 	int i, inbufs, outbufs;
 	uint32_t sc = ctx->sc;
 	union fastrpc_remote_arg *rpra = ctx->rpra;
-	struct device *dev = ctx->fl->sctx->dev;
 
 	inbufs = REMOTE_SCALARS_INBUFS(sc);
 	outbufs = REMOTE_SCALARS_OUTBUFS(sc);
