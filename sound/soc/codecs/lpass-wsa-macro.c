@@ -2839,7 +2839,11 @@ static int wsa_macro_runtime_suspend(struct device *dev)
 	regcache_cache_only(wsa->regmap, true);
 	regcache_mark_dirty(wsa->regmap);
 
-	return pm_clk_suspend(dev);
+	/*
+	 * Keep the clocks: this device provides mclk, whose prepare resumes it
+	 * under the clk prepare lock that unpreparing them here would also need.
+	 */
+	return 0;
 }
 
 static int wsa_macro_runtime_resume(struct device *dev)
