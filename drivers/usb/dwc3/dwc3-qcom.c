@@ -22,6 +22,8 @@
 #include <linux/pm_domain.h>
 #include <linux/usb.h>
 #include <linux/usb/qcom_eud.h>
+#include <linux/usb/typec_dp.h>
+#include <linux/usb/typec_mux.h>
 #include "core.h"
 #include "glue.h"
 
@@ -93,6 +95,13 @@ struct dwc3_qcom {
 
 	enum usb_role		current_role;
 	bool			uses_eusb2_phy;
+
+	/* Serialises the pipe clock selection with Type-C mode changes, suspend and resume */
+	struct mutex		pipe_clk_lock;
+	bool			ignore_pipe_clk;
+	/* The USB-C lanes all carry DP, so the SS PHY supplies no pipe clock */
+	bool			dp_only;
+	struct typec_mux_dev	*mux;
 };
 
 #define to_dwc3_qcom(d) container_of((d), struct dwc3_qcom, dwc)
@@ -361,6 +370,48 @@ static void dwc3_qcom_enable_interrupts(struct dwc3_qcom *qcom)
 		dwc3_qcom_enable_port_interrupts(qcom, i);
 }
 
+static void dwc3_qcom_select_pipe_clk(struct dwc3_qcom *qcom, bool utmi)
+{
+	/* Switch the PIPE clock between the SS PHY and UTMI with it gated */
+	dwc3_qcom_setbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
+			  PIPE_UTMI_CLK_DIS);
+
+	usleep_range(100, 1000);
+
+	if (utmi)
+		dwc3_qcom_setbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
+				  PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
+	else
+		dwc3_qcom_clrbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
+				  PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
+
+	usleep_range(100, 1000);
+
+	dwc3_qcom_clrbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
+			  PIPE_UTMI_CLK_DIS);
+}
+
+/*
+ * Without a pipe clock the controller cannot be reset: a host started in DP-only
+ * mode, as on resume, fails to halt. Run the pipe domain on the UTMI clock whenever
+ * the SS PHY does not supply one. The registers are only reachable while the
+ * controller is resumed, so a change made while suspended is applied on resume.
+ */
+static void dwc3_qcom_update_pipe_clk(struct dwc3_qcom *qcom)
+{
+	bool utmi = qcom->ignore_pipe_clk || qcom->dp_only;
+	u32 val;
+
+	lockdep_assert_held(&qcom->pipe_clk_lock);
+
+	if (qcom->is_suspended)
+		return;
+
+	val = readl(qcom->qscratch_base + QSCRATCH_GENERAL_CFG);
+	if (!!(val & PIPE_UTMI_CLK_SEL) != utmi)
+		dwc3_qcom_select_pipe_clk(qcom, utmi);
+}
+
 static int dwc3_qcom_suspend(struct dwc3_qcom *qcom, bool wakeup)
 {
 	u32 val;
@@ -374,6 +425,11 @@ static int dwc3_qcom_suspend(struct dwc3_qcom *qcom, bool wakeup)
 		if (!(val & PWR_EVNT_LPM_IN_L2_MASK))
 			dev_err(qcom->dev, "port-%d HS-PHY not in L2\n", i + 1);
 	}
+
+	mutex_lock(&qcom->pipe_clk_lock);
+	qcom->is_suspended = true;
+	mutex_unlock(&qcom->pipe_clk_lock);
+
 	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
 
 	ret = dwc3_qcom_interconnect_disable(qcom);
@@ -391,8 +447,6 @@ static int dwc3_qcom_suspend(struct dwc3_qcom *qcom, bool wakeup)
 	} else {
 		dev_pm_genpd_synced_poweroff(qcom->dev);
 	}
-
-	qcom->is_suspended = true;
 
 	return 0;
 }
@@ -423,7 +477,10 @@ static int dwc3_qcom_resume(struct dwc3_qcom *qcom, bool wakeup)
 				  PWR_EVNT_LPM_IN_L2_MASK | PWR_EVNT_LPM_OUT_L2_MASK);
 	}
 
+	mutex_lock(&qcom->pipe_clk_lock);
 	qcom->is_suspended = false;
+	dwc3_qcom_update_pipe_clk(qcom);
+	mutex_unlock(&qcom->pipe_clk_lock);
 
 	return 0;
 }
@@ -447,22 +504,51 @@ static irqreturn_t qcom_dwc3_resume_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static void dwc3_qcom_select_utmi_clk(struct dwc3_qcom *qcom)
+#if IS_ENABLED(CONFIG_TYPEC)
+static int dwc3_qcom_typec_mux_set(struct typec_mux_dev *mux,
+				   struct typec_mux_state *state)
 {
-	/* Configure dwc3 to use UTMI clock as PIPE clock not present */
-	dwc3_qcom_setbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
-			  PIPE_UTMI_CLK_DIS);
+	struct dwc3_qcom *qcom = typec_mux_get_drvdata(mux);
+	bool dp_only = state->alt && state->alt->svid == USB_TYPEC_DP_SID &&
+		       (state->mode == TYPEC_DP_STATE_C || state->mode == TYPEC_DP_STATE_E);
+	bool resumed;
 
-	usleep_range(100, 1000);
+	/* Resuming lets the change reach the registers now; in system suspend it waits */
+	resumed = pm_runtime_resume_and_get(qcom->dev) >= 0;
 
-	dwc3_qcom_setbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
-			  PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
+	mutex_lock(&qcom->pipe_clk_lock);
+	qcom->dp_only = dp_only;
+	dwc3_qcom_update_pipe_clk(qcom);
+	mutex_unlock(&qcom->pipe_clk_lock);
 
-	usleep_range(100, 1000);
+	if (resumed)
+		pm_runtime_put(qcom->dev);
 
-	dwc3_qcom_clrbits(qcom->qscratch_base, QSCRATCH_GENERAL_CFG,
-			  PIPE_UTMI_CLK_DIS);
+	return 0;
 }
+
+static int dwc3_qcom_register_mux(struct dwc3_qcom *qcom)
+{
+	struct typec_mux_desc desc = {
+		.fwnode = dev_fwnode(qcom->dev),
+		.drvdata = qcom,
+		.set = dwc3_qcom_typec_mux_set,
+	};
+
+	/* The Type-C port controller reports pin assignments to every mode switch on the connector */
+	if (!device_property_present(qcom->dev, "mode-switch"))
+		return 0;
+
+	qcom->mux = typec_mux_register(qcom->dev, &desc);
+
+	return PTR_ERR_OR_ZERO(qcom->mux);
+}
+#else
+static int dwc3_qcom_register_mux(struct dwc3_qcom *qcom)
+{
+	return 0;
+}
+#endif
 
 static int dwc3_qcom_request_irq(struct dwc3_qcom *qcom, int irq,
 				 const char *name)
@@ -652,7 +738,6 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	struct resource		res;
 	struct resource		*r;
 	int			ret;
-	bool			ignore_pipe_clk;
 	bool			wakeup_source;
 
 	qcom = devm_kzalloc(&pdev->dev, sizeof(*qcom), GFP_KERNEL);
@@ -660,6 +745,10 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	qcom->dev = &pdev->dev;
+
+	ret = devm_mutex_init(dev, &qcom->pipe_clk_lock);
+	if (ret)
+		return ret;
 
 	pdata = device_get_match_data(dev);
 	if (pdata)
@@ -719,10 +808,11 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	 * Disable pipe_clk requirement if specified. Used when dwc3
 	 * operates without SSPHY and only HS/FS/LS modes are supported.
 	 */
-	ignore_pipe_clk = device_property_read_bool(dev,
+	qcom->ignore_pipe_clk = device_property_read_bool(dev,
 				"qcom,select-utmi-as-pipe-clk");
-	if (ignore_pipe_clk)
-		dwc3_qcom_select_utmi_clk(qcom);
+	mutex_lock(&qcom->pipe_clk_lock);
+	dwc3_qcom_update_pipe_clk(qcom);
+	mutex_unlock(&qcom->pipe_clk_lock);
 
 	qcom->mode = usb_get_dr_mode(dev);
 
@@ -761,8 +851,17 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 
 	qcom->is_suspended = false;
 
+	ret = dwc3_qcom_register_mux(qcom);
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "failed to register Type-C mode switch\n");
+		goto interconnect_exit;
+	}
+
 	return 0;
 
+interconnect_exit:
+	device_init_wakeup(&pdev->dev, false);
+	dwc3_qcom_interconnect_exit(qcom);
 remove_core:
 	dwc3_core_remove(&qcom->dwc);
 clk_disable:
@@ -775,6 +874,8 @@ static void dwc3_qcom_remove(struct platform_device *pdev)
 {
 	struct dwc3 *dwc = platform_get_drvdata(pdev);
 	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
+
+	typec_mux_unregister(qcom->mux);
 
 	if (pm_runtime_resume_and_get(qcom->dev) < 0)
 		return;
