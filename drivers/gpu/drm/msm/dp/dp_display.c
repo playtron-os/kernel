@@ -489,10 +489,13 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
 
 	guard(mutex)(&dp->plugged_lock);
 
-	ret = pm_runtime_resume_and_get(&pdev->dev);
-	if (ret) {
-		DRM_ERROR("failed to pm_runtime_resume\n");
-		return ret;
+	/* HPD can announce a sink that is already plugged, which holds its reference. */
+	if (!dp->plugged) {
+		ret = pm_runtime_resume_and_get(&pdev->dev);
+		if (ret) {
+			DRM_ERROR("failed to pm_runtime_resume\n");
+			return ret;
+		}
 	}
 
 	msm_dp_aux_enable_xfers(dp->aux, true);
@@ -1072,30 +1075,32 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
 
 	msm_dp_aux_enable_xfers(priv->aux, true);
 
+	/*
+	 * Only report what the sink answers. The plug and unplug handlers own
+	 * ->plugged and the reference that keeps a plugged controller on, so a
+	 * read that fails while a dock or adaptor brings its sink up cannot
+	 * unplug it.
+	 */
 	ret = msm_dp_aux_is_link_connected(priv->aux);
 	DRM_DEBUG_DP("aux link status: %x\n", ret);
 	if (!priv->plugged && !ret) {
 		DRM_DEBUG_DP("aux not connected\n");
-		priv->plugged = false;
 		goto end;
 	}
 
 	ret = drm_dp_read_dpcd_caps(priv->aux, dpcd);
 	if (ret) {
 		DRM_DEBUG_DP("failed to read caps\n");
-		priv->plugged = false;
 		goto end;
 	}
 
 	ret = drm_dp_read_desc(priv->aux, &desc, drm_dp_is_branch(dpcd));
 	if (ret) {
 		DRM_DEBUG_DP("failed to read desc\n");
-		priv->plugged = false;
 		goto end;
 	}
 
 	status = connector_status_connected;
-	priv->plugged = true;
 
 	if (drm_dp_read_sink_count_cap(connector, dpcd, &desc)) {
 		int sink_count = drm_dp_read_sink_count(priv->aux);
@@ -1111,18 +1116,12 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
 		status = connector_status_disconnected;
 
 end:
-	/*
-	 * If we detected the DPRX, leave the controller on so that it doesn't
-	 * lose the state.
-	 */
-	if (!priv->plugged) {
-		if (phy_deinit) {
-			msm_dp_aux_enable_xfers(priv->aux, false);
-			msm_dp_display_host_phy_exit(priv);
-		}
-
-		pm_runtime_put_sync(&dp->pdev->dev);
+	if (!priv->plugged && phy_deinit) {
+		msm_dp_aux_enable_xfers(priv->aux, false);
+		msm_dp_display_host_phy_exit(priv);
 	}
+
+	pm_runtime_put_sync(&dp->pdev->dev);
 
 	return status;
 }
@@ -1839,7 +1838,17 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
 	drm_dbg_dp(dp->drm_dev, "type=%d link hpd_link_status=0x%x, status=%d\n",
 		   msm_dp_display->connector_type, hpd_link_status, status);
 
-	if (extra_status == DRM_CONNECTOR_DP_IRQ_HPD ||
+	/*
+	 * A connector probe passes on what detect() read and has no hotplug to
+	 * send. Only HPD unplugs a sink or sets it up again: a probe racing an
+	 * adaptor that is bringing its sink up can read nothing, and unplugging
+	 * on that took the link down under the modeset that followed. A probe
+	 * still sets up a sink that no HPD event announced.
+	 */
+	if (!send_hotplug && extra_status == DRM_CONNECTOR_NO_EXTRA_STATUS) {
+		if (status == connector_status_connected && !dp->plugged)
+			msm_dp_hpd_plug_handle(dp);
+	} else if (extra_status == DRM_CONNECTOR_DP_IRQ_HPD ||
 	    hpd_link_status == ISR_IRQ_HPD_PULSE_COUNT) {
 		msm_dp_irq_hpd_handle(dp);
 	} else if (status == connector_status_connected) {
