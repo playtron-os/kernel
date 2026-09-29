@@ -799,6 +799,14 @@ static int msm_dp_display_enable(struct msm_dp_display_private *dp,
 	drm_dbg_dp(dp->drm_dev, "sink_count=%d\n", dp->link->sink_count);
 
 	rc = msm_dp_ctrl_on_stream(dp->ctrl, msm_dp_panel, msm_dp_display->mst_active);
+	/*
+	 * A stream that never started must not count as active: disabling it
+	 * would push idle a link that is not running, which resets glymur.
+	 */
+	if (rc) {
+		msm_dp_ctrl_off_pixel_clk(dp->ctrl, msm_dp_panel->stream_id);
+		return rc;
+	}
 
 	msm_dp_display->active_stream_cnt++;
 
@@ -1672,8 +1680,10 @@ void msm_dp_display_enable_helper(struct msm_dp *msm_dp_display, struct msm_dp_p
 
 	if (msm_dp_display->link_ready) {
 		rc = msm_dp_display_enable(dp, msm_dp_panel);
-		if (rc)
+		if (rc) {
 			DRM_ERROR("DP display enable failed, rc=%d\n", rc);
+			return;
+		}
 
 		rc = msm_dp_display_post_enable(msm_dp_display);
 		if (rc) {
