@@ -297,6 +297,28 @@ static void msm_dp_display_mst_init(struct msm_dp_display_private *dp)
 	msm_dp->mst_active = true;
 }
 
+/*
+ * A dock or adaptor can report its sink before it answers on DDC, and a failed
+ * read leaves the connector with no modes but 640x480, so try a few times. The
+ * HPD state register cannot cut this short: over USB-C it never reads connected.
+ */
+static const struct drm_edid *msm_dp_display_read_edid(struct msm_dp_display_private *dp,
+						       struct drm_connector *connector)
+{
+	const struct drm_edid *drm_edid;
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		if (i)
+			msleep(100);
+		drm_edid = drm_edid_read_ddc(connector, &dp->aux->ddc);
+		if (drm_edid)
+			break;
+	}
+
+	return drm_edid;
+}
+
 static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 {
 	struct drm_connector *connector = dp->msm_dp_display.connector;
@@ -316,8 +338,13 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 		goto end;
 
 	if (!(dp->max_stream > 1) || !drm_dp_read_mst_cap(dp->aux, dp->panel->dpcd)) {
-		drm_edid = drm_edid_read_ddc(connector, &dp->aux->ddc);
-		drm_edid_connector_update(connector, drm_edid);
+		drm_edid = msm_dp_display_read_edid(dp, connector);
+		/*
+		 * HPD can announce a plugged sink again, as an adaptor does when it
+		 * reconfigures its lanes; a failed read then must not drop its EDID.
+		 */
+		if (drm_edid || !dp->plugged)
+			drm_edid_connector_update(connector, drm_edid);
 
 		if (!drm_edid) {
 			DRM_ERROR("panel edid read failed\n");
@@ -898,6 +925,7 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 int msm_dp_display_get_modes(struct msm_dp *dp)
 {
 	struct msm_dp_display_private *msm_dp_display;
+	struct drm_connector *connector;
 
 	if (!dp) {
 		DRM_ERROR("invalid params\n");
@@ -905,8 +933,22 @@ int msm_dp_display_get_modes(struct msm_dp *dp)
 	}
 
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+	connector = msm_dp_display->panel->connector;
 
-	return drm_edid_connector_add_modes(msm_dp_display->panel->connector);
+	/*
+	 * The EDID is read once at HPD, which a slow sink or adaptor can fail.
+	 * Read it again on a later probe instead of waiting for a replug.
+	 */
+	if (!dp->is_edp && !connector->edid_blob_ptr) {
+		const struct drm_edid *drm_edid;
+
+		drm_edid = drm_edid_read_ddc(connector, &msm_dp_display->aux->ddc);
+		if (drm_edid)
+			drm_edid_connector_update(connector, drm_edid);
+		drm_edid_free(drm_edid);
+	}
+
+	return drm_edid_connector_add_modes(connector);
 }
 
 bool msm_dp_display_check_video_test(struct msm_dp *dp)
