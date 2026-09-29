@@ -2219,11 +2219,21 @@ static int msm_dp_ctrl_deinitialize_mainlink(struct msm_dp_ctrl_private *ctrl,
 	return 0;
 }
 
+static void msm_dp_ctrl_config_stream(struct msm_dp_ctrl_private *ctrl,
+				      struct msm_dp_panel *panel);
+
 static int msm_dp_ctrl_link_maintenance(struct msm_dp_ctrl_private *ctrl,
 					struct msm_dp_panel *panel)
 {
 	int ret = 0;
 	int training_step = DP_TRAINING_NONE;
+
+	/*
+	 * Pushing idle a link that carries no stream resets glymur. Such a
+	 * link has nothing to maintain: the stream's enable trains it.
+	 */
+	if (!ctrl->stream_clks_on[panel->stream_id])
+		return 0;
 
 	msm_dp_ctrl_push_idle(&ctrl->msm_dp_ctrl);
 
@@ -2235,6 +2245,14 @@ static int msm_dp_ctrl_link_maintenance(struct msm_dp_ctrl_private *ctrl,
 		goto end;
 
 	msm_dp_ctrl_clear_training_pattern(ctrl, panel, DP_PHY_DPRX);
+
+	/*
+	 * Training reset the main link, and the stream's configuration with it:
+	 * without this the link came back trained but carried no picture.
+	 */
+	reinit_completion(&ctrl->video_comp);
+	if (!ctrl->mst_active)
+		msm_dp_ctrl_config_stream(ctrl, panel);
 
 	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, DP_STATE_CTRL_SEND_VIDEO);
 
@@ -2877,6 +2895,30 @@ int msm_dp_ctrl_prepare_stream_on(struct msm_dp_ctrl *msm_dp_ctrl,
 	return ret;
 }
 
+/* What a stream needs on a trained link; resetting the main link drops it. */
+static void msm_dp_ctrl_config_stream(struct msm_dp_ctrl_private *ctrl,
+				      struct msm_dp_panel *panel)
+{
+	msm_dp_ctrl_lane_mapping(ctrl);
+	msm_dp_setup_peripheral_flush(ctrl);
+	if (ctrl->mst_active)
+		msm_dp_ctrl_mst_config(ctrl, true);
+
+	if (panel->stream_id == DP_STREAM_0)
+		msm_dp_ctrl_config_ctrl_link(ctrl, panel);
+
+	msm_dp_ctrl_configure_source_params(ctrl, panel);
+
+	msm_dp_ctrl_config_msa(ctrl,
+		panel, ctrl->link->link_params.rate,
+		panel->msm_dp_mode.drm_mode.clock);
+
+	msm_dp_panel_clear_dsc_dto(panel);
+
+	if (!ctrl->mst_active)
+		msm_dp_ctrl_setup_tr_unit(ctrl, panel);
+}
+
 int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, struct msm_dp_panel *panel,
 			  bool mst_active)
 {
@@ -2911,24 +2953,7 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, struct msm_dp_panel *
 	 */
 	reinit_completion(&ctrl->video_comp);
 
-	msm_dp_ctrl_lane_mapping(ctrl);
-	msm_dp_setup_peripheral_flush(ctrl);
-	if (ctrl->mst_active)
-		msm_dp_ctrl_mst_config(ctrl, true);
-
-	if (panel->stream_id == DP_STREAM_0)
-		msm_dp_ctrl_config_ctrl_link(ctrl, panel);
-
-	msm_dp_ctrl_configure_source_params(ctrl, panel);
-
-	msm_dp_ctrl_config_msa(ctrl,
-		panel, ctrl->link->link_params.rate,
-		pixel_rate_orig);
-
-	msm_dp_panel_clear_dsc_dto(panel);
-
-	if (!ctrl->mst_active)
-		msm_dp_ctrl_setup_tr_unit(ctrl, panel);
+	msm_dp_ctrl_config_stream(ctrl, panel);
 
 	msm_dp_ctrl_mst_stream_setup(ctrl, panel);
 
