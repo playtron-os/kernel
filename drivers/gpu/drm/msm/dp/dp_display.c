@@ -1653,6 +1653,37 @@ bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
 	return dp->wide_bus_supported;
 }
 
+/**
+ * msm_dp_mode_bpc() - bits per colour component @mode goes out with
+ * @msm_dp_display: DP display
+ * @mode: the mode, as the encoder has it
+ *
+ * The link can carry fewer bits than the sink takes, and the mode then goes out
+ * at 6 bpc, which needs dithering. This is what the bridge picks when it enables
+ * the mode, after the encoder.
+ *
+ * Returns: the bpc, or 0 when unknown (MST, a video test pattern).
+ */
+unsigned int msm_dp_mode_bpc(struct msm_dp *msm_dp_display, const struct drm_display_mode *mode)
+{
+	struct msm_dp_display_private *dp;
+	u32 bpp;
+
+	if (!msm_dp_display || !msm_dp_display->connector || msm_dp_display->mst_active)
+		return 0;
+
+	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+	if (dp->panel->video_test)
+		return 0;
+
+	bpp = msm_dp_panel_get_mode_bpp(dp->panel,
+			msm_dp_display_max_bpc(dp, &msm_dp_display->connector->display_info,
+					       mode->clock) * 3,
+			mode->clock);
+
+	return bpp / 3;
+}
+
 void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *root, bool is_edp)
 {
 	struct msm_dp_display_private *dp;
