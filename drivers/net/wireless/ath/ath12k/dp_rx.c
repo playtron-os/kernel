@@ -68,12 +68,14 @@ static void ath12k_dp_rx_enqueue_free(struct ath12k_dp *dp,
 	spin_unlock_bh(&dp->rx_desc_lock);
 }
 
-/* Returns number of Rx buffers replenished */
-int ath12k_dp_rx_bufs_replenish(struct ath12k_dp *dp,
-				struct dp_rxdma_ring *rx_ring,
-				struct list_head *used_list,
-				int req_entries)
+/* Returns number of Rx buffers replenished, taking them from @prealloc when given */
+static int __ath12k_dp_rx_bufs_replenish(struct ath12k_dp *dp,
+					 struct dp_rxdma_ring *rx_ring,
+					 struct list_head *used_list,
+					 int req_entries,
+					 struct sk_buff_head *prealloc)
 {
+	bool alloc_failed = false;
 	struct ath12k_base *ab = dp->ab;
 	struct ath12k_buffer_addr *desc;
 	struct hal_srng *srng;
@@ -114,10 +116,15 @@ int ath12k_dp_rx_bufs_replenish(struct ath12k_dp *dp,
 	}
 
 	while (num_remain > 0) {
-		skb = dev_alloc_skb(DP_RX_BUFFER_SIZE +
-				    DP_RX_BUFFER_ALIGN_SIZE);
-		if (!skb)
+		if (prealloc)
+			skb = __skb_dequeue(prealloc);
+		else
+			skb = dev_alloc_skb(DP_RX_BUFFER_SIZE +
+					    DP_RX_BUFFER_ALIGN_SIZE);
+		if (!skb) {
+			alloc_failed = !prealloc;
 			break;
+		}
 
 		if (!IS_ALIGNED((unsigned long)skb->data,
 				DP_RX_BUFFER_ALIGN_SIZE)) {
@@ -169,9 +176,60 @@ out:
 
 	spin_unlock_bh(&srng->lock);
 
+	if (alloc_failed && rx_ring == &dp->rx_refill_buf_ring)
+		schedule_delayed_work(&dp->rx_refill_retry, 0);
+
 	return req_entries - num_remain;
 }
+
+/* Returns number of Rx buffers replenished */
+int ath12k_dp_rx_bufs_replenish(struct ath12k_dp *dp,
+				struct dp_rxdma_ring *rx_ring,
+				struct list_head *used_list,
+				int req_entries)
+{
+	return __ath12k_dp_rx_bufs_replenish(dp, rx_ring, used_list, req_entries, NULL);
+}
 EXPORT_SYMBOL(ath12k_dp_rx_bufs_replenish);
+
+#define ATH12K_DP_RX_REFILL_BATCH	256
+#define ATH12K_DP_RX_REFILL_BACKOFF_MS	20
+
+/*
+ * The refill ring is only refilled after received frames are reaped, and its
+ * atomic allocations fail under memory pressure. Once it has drained, nothing
+ * would refill it and reception stops for good, so refill it here, where the
+ * allocations can reclaim, until it is full.
+ */
+static void ath12k_dp_rx_refill_retry(struct work_struct *work)
+{
+	struct ath12k_dp *dp = container_of(to_delayed_work(work), struct ath12k_dp,
+					    rx_refill_retry);
+	struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
+	struct sk_buff_head prealloc;
+	struct sk_buff *skb;
+	LIST_HEAD(list);
+	int allocated;
+
+	__skb_queue_head_init(&prealloc);
+	for (allocated = 0; allocated < ATH12K_DP_RX_REFILL_BATCH; allocated++) {
+		skb = __netdev_alloc_skb(NULL, DP_RX_BUFFER_SIZE + DP_RX_BUFFER_ALIGN_SIZE,
+					 GFP_KERNEL);
+		if (!skb)
+			break;
+		__skb_queue_tail(&prealloc, skb);
+	}
+
+	__ath12k_dp_rx_bufs_replenish(dp, rx_ring, &list, rx_ring->bufs_max, &prealloc);
+
+	/* The ring took every buffer: it may want more, or memory is still short */
+	if (skb_queue_empty(&prealloc))
+		schedule_delayed_work(&dp->rx_refill_retry,
+				      allocated == ATH12K_DP_RX_REFILL_BATCH ? 0 :
+				      msecs_to_jiffies(ATH12K_DP_RX_REFILL_BACKOFF_MS));
+
+	__skb_queue_purge(&prealloc);
+}
 
 static int ath12k_dp_rxdma_mon_buf_ring_free(struct ath12k_base *ab,
 					     struct dp_rxdma_mon_ring *rx_ring)
@@ -1592,6 +1650,9 @@ void ath12k_dp_rx_free(struct ath12k_base *ab)
 	struct dp_srng *srng;
 	int i;
 
+	/* Set up only once ath12k_dp_rx_alloc() got that far */
+	if (dp->rx_refill_retry.work.func)
+		disable_delayed_work_sync(&dp->rx_refill_retry);
 	ath12k_dp_srng_cleanup(ab, &dp->rx_refill_buf_ring.refill_buf_ring);
 
 	for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
@@ -1759,6 +1820,8 @@ int ath12k_dp_rx_alloc(struct ath12k_base *ab)
 			}
 		}
 	}
+
+	INIT_DELAYED_WORK(&dp->rx_refill_retry, ath12k_dp_rx_refill_retry);
 
 	ret = ath12k_dp_rxdma_buf_setup(ab);
 	if (ret) {
