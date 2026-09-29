@@ -597,7 +597,7 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
 	return 0;
 }
 
-static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
+static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp, bool *ds_port_changed)
 {
 	u32 sink_request;
 	int rc = 0;
@@ -624,10 +624,12 @@ static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
 	if (!rc) {
 		sink_request = dp->link->sink_request;
 		drm_dbg_dp(dp->drm_dev, "sink_request=%d\n", sink_request);
-		if (sink_request & DS_PORT_STATUS_CHANGED)
+		if (sink_request & DS_PORT_STATUS_CHANGED) {
+			*ds_port_changed = true;
 			rc = msm_dp_display_process_hpd_high(dp);
-		else
+		} else {
 			rc = msm_dp_display_handle_irq_hpd(dp);
+		}
 	}
 
 	drm_dbg_dp(dp->drm_dev, "After, type=%d, sink_count=%d\n",
@@ -1894,7 +1896,27 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
 			msm_dp_hpd_plug_handle(dp);
 	} else if (extra_status == DRM_CONNECTOR_DP_IRQ_HPD ||
 	    hpd_link_status == ISR_IRQ_HPD_PULSE_COUNT) {
-		msm_dp_irq_hpd_handle(dp);
+		/*
+		 * A sink raises IRQ_HPD only with HPD high, and pmic_glink_altmode
+		 * reports a notification carrying both as the IRQ alone, so a dock
+		 * can announce itself with one. A sink that is not set up, or did
+		 * not answer when it was, is set up instead of serviced.
+		 */
+		bool set_up = msm_dp_display->is_edp ||
+			      (dp->plugged && !dp->sink_unresponsive);
+		bool ds_port_changed = false;
+
+		if (set_up)
+			msm_dp_irq_hpd_handle(dp, &ds_port_changed);
+		else
+			msm_dp_hpd_plug_handle(dp);
+
+		/*
+		 * An IRQ-only notification sends no hotplug event, and a dock reports
+		 * a monitor plugged into it or unplugged with IRQ_HPD alone.
+		 */
+		if (!send_hotplug && !msm_dp_display->is_edp && (!set_up || ds_port_changed))
+			drm_kms_helper_connector_hotplug_event(connector);
 	} else if (status == connector_status_connected) {
 		if (hpd_link_status == ISR_HPD_REPLUG_COUNT) {
 			msm_dp_hpd_unplug_handle(dp);
