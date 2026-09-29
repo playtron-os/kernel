@@ -1056,6 +1056,20 @@ static int q6apm_dai_hw_free(struct snd_soc_component *component,
 	struct q6apm_dai_rtd *prtd = substream->runtime->private_data;
 	int ret;
 
+	/*
+	 * prepare() starts the graph, and a stream that is never triggered is
+	 * never stopped. The back end closes the graph feeding a capture next:
+	 * closed under a running graph with reads queued, the DSP never answers
+	 * again. Stop it here, before any back end shuts down, and leave the
+	 * running state first so that reads completing meanwhile are not queued
+	 * again.
+	 */
+	if (prtd->state) {
+		prtd->state = Q6APM_STREAM_IDLE;
+		q6apm_graph_stop(prtd->graph);
+		q6apm_free_fragments(prtd->graph, substream->stream);
+	}
+
 	if (pdata && prtd->scm_assigned) {
 		ret = q6apm_dai_unassign_memory(prtd, pdata);
 		if (ret)
