@@ -750,6 +750,36 @@ error:
 	return rc;
 }
 
+/*
+ * The most bits per colour the sink takes at @clock: its EDID's, 8 when that says
+ * nothing, and no more than a DP-to-HDMI, DVI or VGA converter in front of it
+ * reports it carries. A converter given more than that mangles the colours. Deep
+ * colour also raises the TMDS clock behind the converter, which the converter and
+ * the display must both take, and an HDMI display must list it for RGB.
+ */
+static u32 msm_dp_display_max_bpc(struct msm_dp_display_private *dp,
+				  const struct drm_display_info *info, int clock)
+{
+	const u8 *dpcd = dp->panel->dpcd, *ports = dp->panel->downstream_ports;
+	int port_bpc = drm_dp_downstream_max_bpc(dpcd, ports, NULL);
+	int tmds = drm_dp_downstream_max_tmds_clock(dpcd, ports, NULL);
+	/* msm sends at most 10 bpc */
+	u32 bpc = min_t(u32, info->bpc ?: 8, 10);
+
+	if (port_bpc > 0)
+		bpc = min_t(u32, bpc, port_bpc);
+
+	if (tmds > 0 && bpc > 8) {
+		if (info->max_tmds_clock)
+			tmds = min(tmds, info->max_tmds_clock);
+		if (clock * bpc / 8 > tmds ||
+		    (info->is_hdmi && !(info->edid_hdmi_rgb444_dc_modes & DRM_EDID_HDMI_DC_30)))
+			bpc = 8;
+	}
+
+	return bpc;
+}
+
 static int msm_dp_display_set_mode(struct msm_dp *msm_dp_display,
 				   const struct drm_display_mode *adjusted_mode,
 				   struct msm_dp_panel *msm_dp_panel)
@@ -762,7 +792,8 @@ static int msm_dp_display_set_mode(struct msm_dp *msm_dp_display,
 	if (msm_dp_display_check_video_test(msm_dp_display))
 		bpp = msm_dp_display_get_test_bpp(msm_dp_display);
 	else
-		bpp = msm_dp_panel->connector->display_info.bpc * 3;
+		bpp = msm_dp_display_max_bpc(dp, &msm_dp_panel->connector->display_info,
+					     adjusted_mode->clock) * 3;
 
 	msm_dp_panel_init_panel_info(msm_dp_panel, adjusted_mode, bpp ? bpp : 24);
 
@@ -919,12 +950,12 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 					       const struct drm_display_info *info,
 					       const struct drm_display_mode *mode)
 {
-	const u32 num_components = 3, default_bpp = 24;
+	const u32 num_components = 3;
 	struct msm_dp_display_private *msm_dp_display;
 	struct msm_dp_link_info *link_info;
 	u32 mode_rate_khz = 0, supported_rate_khz = 0, mode_bpp = 0;
 	int mode_pclk_khz = mode->clock;
-	int link_pclk_khz;
+	int link_pclk_khz, tmds_khz;
 	bool is_yuv_420;
 
 	if (!dp || !mode_pclk_khz || !dp->connector) {
@@ -946,9 +977,14 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 	if (mode_pclk_khz > DP_MAX_PIXEL_CLK_KHZ)
 		return MODE_CLOCK_HIGH;
 
-	mode_bpp = dp->connector->display_info.bpc * num_components;
-	if (!mode_bpp)
-		mode_bpp = default_bpp;
+	/* A DP-to-HDMI or DVI converter must be able to send the mode at 8 bpc. */
+	tmds_khz = drm_dp_downstream_max_tmds_clock(msm_dp_display->panel->dpcd,
+						    msm_dp_display->panel->downstream_ports, NULL);
+	if (tmds_khz > 0 && link_pclk_khz > tmds_khz)
+		return MODE_CLOCK_HIGH;
+
+	mode_bpp = msm_dp_display_max_bpc(msm_dp_display, &dp->connector->display_info,
+					  link_pclk_khz) * num_components;
 
 	mode_bpp = msm_dp_panel_get_mode_bpp(msm_dp_display->panel,
 			mode_bpp, link_pclk_khz);
@@ -1615,6 +1651,37 @@ bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
 		return false;
 
 	return dp->wide_bus_supported;
+}
+
+/**
+ * msm_dp_mode_bpc() - bits per colour component @mode goes out with
+ * @msm_dp_display: DP display
+ * @mode: the mode, as the encoder has it
+ *
+ * The link can carry fewer bits than the sink takes, and the mode then goes out
+ * at 6 bpc, which needs dithering. This is what the bridge picks when it enables
+ * the mode, after the encoder.
+ *
+ * Returns: the bpc, or 0 when unknown (MST, a video test pattern).
+ */
+unsigned int msm_dp_mode_bpc(struct msm_dp *msm_dp_display, const struct drm_display_mode *mode)
+{
+	struct msm_dp_display_private *dp;
+	u32 bpp;
+
+	if (!msm_dp_display || !msm_dp_display->connector || msm_dp_display->mst_active)
+		return 0;
+
+	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+	if (dp->panel->video_test)
+		return 0;
+
+	bpp = msm_dp_panel_get_mode_bpp(dp->panel,
+			msm_dp_display_max_bpc(dp, &msm_dp_display->connector->display_info,
+					       mode->clock) * 3,
+			mode->clock);
+
+	return bpp / 3;
 }
 
 void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *root, bool is_edp)

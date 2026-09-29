@@ -1299,9 +1299,17 @@ static void _dpu_encoder_virt_enable_helper(struct drm_encoder *drm_enc)
 	if (dpu_enc->disp_info.is_cmd_mode)
 		_dpu_encoder_update_vsync_source(dpu_enc, &dpu_enc->disp_info);
 
-	if (dpu_enc->disp_info.intf_type == INTF_DSI &&
+	if ((dpu_enc->disp_info.intf_type == INTF_DSI ||
+	     dpu_enc->disp_info.intf_type == INTF_DP) &&
 			!WARN_ON(dpu_enc->num_phys_encs == 0)) {
+		struct msm_drm_private *priv = drm_enc->dev->dev_private;
 		unsigned bpc = dpu_enc->connector->display_info.bpc;
+
+		/* DP drops to 6 bpc when the link cannot carry more */
+		if (dpu_enc->disp_info.intf_type == INTF_DP)
+			bpc = msm_dp_mode_bpc(priv->kms->dp[dpu_enc->disp_info.h_tile_instance[0]],
+					      &dpu_enc->cur_master->cached_mode);
+
 		for (i = 0; i < MAX_CHANNELS_PER_ENC; i++) {
 			if (!dpu_enc->hw_pp[i])
 				continue;
