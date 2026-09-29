@@ -57,6 +57,7 @@ struct msm_dp_display_private {
 
 	struct mutex plugged_lock;
 	bool plugged;
+	bool sink_unresponsive;
 
 	struct drm_device *drm_dev;
 
@@ -319,6 +320,18 @@ static const struct drm_edid *msm_dp_display_read_edid(struct msm_dp_display_pri
 	return drm_edid;
 }
 
+/*
+ * HPD can report a sink whose AUX never answers, as a USB-C dock that did not
+ * enter DP alt mode does, and each read of it retries to the AUX timeout: about
+ * 8 s. Stop reading it, and fail AUX character device reads such as fwupd's at
+ * once, until HPD announces the sink again.
+ */
+static void msm_dp_display_sink_unresponsive(struct msm_dp_display_private *dp)
+{
+	dp->sink_unresponsive = true;
+	msm_dp_aux_enable_xfers(dp->aux, false);
+}
+
 static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 {
 	struct drm_connector *connector = dp->msm_dp_display.connector;
@@ -328,8 +341,10 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 	const struct drm_edid *drm_edid = NULL;
 
 	rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
-	if (rc)
+	if (rc) {
+		msm_dp_display_sink_unresponsive(dp);
 		goto end;
+	}
 
 	dp->link->lttpr_count = msm_dp_display_lttpr_init(dp, dpcd);
 
@@ -498,6 +513,7 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
 		}
 	}
 
+	dp->sink_unresponsive = false;
 	msm_dp_aux_enable_xfers(dp->aux, true);
 
 	msm_dp_display_host_phy_init(dp);
@@ -595,6 +611,12 @@ static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
 	if (msm_dp_display->mst_active) {
 		msm_dp_mst_display_hpd_irq(&dp->msm_dp_display);
 		return 0;
+	}
+
+	/* A sink that raises an IRQ answers again. */
+	if (dp->sink_unresponsive && dp->plugged) {
+		dp->sink_unresponsive = false;
+		msm_dp_aux_enable_xfers(dp->aux, true);
 	}
 
 	/* check for any test request issued by sink */
@@ -1086,6 +1108,9 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
 
 	phy_deinit = msm_dp_display_host_phy_init(priv);
 
+	if (priv->plugged && priv->sink_unresponsive)
+		goto end;
+
 	msm_dp_aux_enable_xfers(priv->aux, true);
 
 	/*
@@ -1104,12 +1129,16 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
 	ret = drm_dp_read_dpcd_caps(priv->aux, dpcd);
 	if (ret) {
 		DRM_DEBUG_DP("failed to read caps\n");
+		if (priv->plugged)
+			msm_dp_display_sink_unresponsive(priv);
 		goto end;
 	}
 
 	ret = drm_dp_read_desc(priv->aux, &desc, drm_dp_is_branch(dpcd));
 	if (ret) {
 		DRM_DEBUG_DP("failed to read desc\n");
+		if (priv->plugged)
+			msm_dp_display_sink_unresponsive(priv);
 		goto end;
 	}
 
