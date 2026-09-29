@@ -906,11 +906,23 @@ static int msm_dp_link_process_phy_test_pattern_request(
 	return 0;
 }
 
+/*
+ * A sink without PSR need not implement its registers: a USB-C to HDMI
+ * adaptor answers every read in that range with the low byte of the address.
+ */
+static bool msm_dp_link_psr_supported(struct msm_dp_link_private *link)
+{
+	u8 version;
+
+	return !drm_dp_dpcd_read_byte(link->aux, DP_PSR_SUPPORT, &version) && version;
+}
+
 static bool msm_dp_link_read_psr_error_status(struct msm_dp_link_private *link)
 {
 	u8 status;
 
-	drm_dp_dpcd_read(link->aux, DP_PSR_ERROR_STATUS, &status, 1);
+	if (drm_dp_dpcd_read_byte(link->aux, DP_PSR_ERROR_STATUS, &status) < 0)
+		return false;
 
 	if (status & DP_PSR_LINK_CRC_ERROR)
 		DRM_ERROR("PSR LINK CRC ERROR\n");
@@ -928,7 +940,8 @@ static bool msm_dp_link_psr_capability_changed(struct msm_dp_link_private *link)
 {
 	u8 status;
 
-	drm_dp_dpcd_read(link->aux, DP_PSR_ESI, &status, 1);
+	if (drm_dp_dpcd_read_byte(link->aux, DP_PSR_ESI, &status) < 0)
+		return false;
 
 	if (status & DP_PSR_CAPS_CHANGE) {
 		drm_dbg_dp(link->drm_dev, "PSR Capability Change\n");
@@ -1034,6 +1047,7 @@ int msm_dp_link_process_request(struct msm_dp_link *msm_dp_link)
 {
 	int ret = 0;
 	struct msm_dp_link_private *link;
+	bool psr;
 
 	if (!msm_dp_link) {
 		DRM_ERROR("invalid input\n");
@@ -1048,6 +1062,8 @@ int msm_dp_link_process_request(struct msm_dp_link *msm_dp_link)
 	if (ret)
 		return ret;
 
+	psr = msm_dp_link_psr_supported(link);
+
 	if (link->request.test_requested == DP_TEST_LINK_EDID_READ) {
 		msm_dp_link->sink_request |= DP_TEST_LINK_EDID_READ;
 	} else if (!msm_dp_link_process_ds_port_status_change(link)) {
@@ -1056,9 +1072,9 @@ int msm_dp_link_process_request(struct msm_dp_link *msm_dp_link)
 		msm_dp_link->sink_request |= DP_TEST_LINK_TRAINING;
 	} else if (!msm_dp_link_process_phy_test_pattern_request(link)) {
 		msm_dp_link->sink_request |= DP_TEST_LINK_PHY_TEST_PATTERN;
-	} else if (msm_dp_link_read_psr_error_status(link)) {
+	} else if (psr && msm_dp_link_read_psr_error_status(link)) {
 		DRM_ERROR("PSR IRQ_HPD received\n");
-	} else if (msm_dp_link_psr_capability_changed(link)) {
+	} else if (psr && msm_dp_link_psr_capability_changed(link)) {
 		drm_dbg_dp(link->drm_dev, "PSR Capability changed\n");
 	} else {
 		ret = msm_dp_link_process_link_status_update(link);
