@@ -57,6 +57,7 @@ struct msm_dp_display_private {
 
 	struct mutex plugged_lock;
 	bool plugged;
+	bool sink_unresponsive;
 
 	struct drm_device *drm_dev;
 
@@ -297,6 +298,40 @@ static void msm_dp_display_mst_init(struct msm_dp_display_private *dp)
 	msm_dp->mst_active = true;
 }
 
+/*
+ * A dock or adaptor can report its sink before it answers on DDC, and a failed
+ * read leaves the connector with no modes but 640x480, so try a few times. The
+ * HPD state register cannot cut this short: over USB-C it never reads connected.
+ */
+static const struct drm_edid *msm_dp_display_read_edid(struct msm_dp_display_private *dp,
+						       struct drm_connector *connector)
+{
+	const struct drm_edid *drm_edid;
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		if (i)
+			msleep(100);
+		drm_edid = drm_edid_read_ddc(connector, &dp->aux->ddc);
+		if (drm_edid)
+			break;
+	}
+
+	return drm_edid;
+}
+
+/*
+ * HPD can report a sink whose AUX never answers, as a USB-C dock that did not
+ * enter DP alt mode does, and each read of it retries to the AUX timeout: about
+ * 8 s. Stop reading it, and fail AUX character device reads such as fwupd's at
+ * once, until HPD announces the sink again.
+ */
+static void msm_dp_display_sink_unresponsive(struct msm_dp_display_private *dp)
+{
+	dp->sink_unresponsive = true;
+	msm_dp_aux_enable_xfers(dp->aux, false);
+}
+
 static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 {
 	struct drm_connector *connector = dp->msm_dp_display.connector;
@@ -306,8 +341,10 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 	const struct drm_edid *drm_edid = NULL;
 
 	rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
-	if (rc)
+	if (rc) {
+		msm_dp_display_sink_unresponsive(dp);
 		goto end;
+	}
 
 	dp->link->lttpr_count = msm_dp_display_lttpr_init(dp, dpcd);
 
@@ -316,8 +353,13 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 		goto end;
 
 	if (!(dp->max_stream > 1) || !drm_dp_read_mst_cap(dp->aux, dp->panel->dpcd)) {
-		drm_edid = drm_edid_read_ddc(connector, &dp->aux->ddc);
-		drm_edid_connector_update(connector, drm_edid);
+		drm_edid = msm_dp_display_read_edid(dp, connector);
+		/*
+		 * HPD can announce a plugged sink again, as an adaptor does when it
+		 * reconfigures its lanes; a failed read then must not drop its EDID.
+		 */
+		if (drm_edid || !dp->plugged)
+			drm_edid_connector_update(connector, drm_edid);
 
 		if (!drm_edid) {
 			DRM_ERROR("panel edid read failed\n");
@@ -462,12 +504,16 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
 
 	guard(mutex)(&dp->plugged_lock);
 
-	ret = pm_runtime_resume_and_get(&pdev->dev);
-	if (ret) {
-		DRM_ERROR("failed to pm_runtime_resume\n");
-		return ret;
+	/* HPD can announce a sink that is already plugged, which holds its reference. */
+	if (!dp->plugged) {
+		ret = pm_runtime_resume_and_get(&pdev->dev);
+		if (ret) {
+			DRM_ERROR("failed to pm_runtime_resume\n");
+			return ret;
+		}
 	}
 
+	dp->sink_unresponsive = false;
 	msm_dp_aux_enable_xfers(dp->aux, true);
 
 	msm_dp_display_host_phy_init(dp);
@@ -551,7 +597,7 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
 	return 0;
 }
 
-static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
+static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp, bool *ds_port_changed)
 {
 	u32 sink_request;
 	int rc = 0;
@@ -567,15 +613,23 @@ static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
 		return 0;
 	}
 
+	/* A sink that raises an IRQ answers again. */
+	if (dp->sink_unresponsive && dp->plugged) {
+		dp->sink_unresponsive = false;
+		msm_dp_aux_enable_xfers(dp->aux, true);
+	}
+
 	/* check for any test request issued by sink */
 	rc = msm_dp_link_process_request(dp->link);
 	if (!rc) {
 		sink_request = dp->link->sink_request;
 		drm_dbg_dp(dp->drm_dev, "sink_request=%d\n", sink_request);
-		if (sink_request & DS_PORT_STATUS_CHANGED)
+		if (sink_request & DS_PORT_STATUS_CHANGED) {
+			*ds_port_changed = true;
 			rc = msm_dp_display_process_hpd_high(dp);
-		else
+		} else {
 			rc = msm_dp_display_handle_irq_hpd(dp);
+		}
 	}
 
 	drm_dbg_dp(dp->drm_dev, "After, type=%d, sink_count=%d\n",
@@ -696,6 +750,36 @@ error:
 	return rc;
 }
 
+/*
+ * The most bits per colour the sink takes at @clock: its EDID's, 8 when that says
+ * nothing, and no more than a DP-to-HDMI, DVI or VGA converter in front of it
+ * reports it carries. A converter given more than that mangles the colours. Deep
+ * colour also raises the TMDS clock behind the converter, which the converter and
+ * the display must both take, and an HDMI display must list it for RGB.
+ */
+static u32 msm_dp_display_max_bpc(struct msm_dp_display_private *dp,
+				  const struct drm_display_info *info, int clock)
+{
+	const u8 *dpcd = dp->panel->dpcd, *ports = dp->panel->downstream_ports;
+	int port_bpc = drm_dp_downstream_max_bpc(dpcd, ports, NULL);
+	int tmds = drm_dp_downstream_max_tmds_clock(dpcd, ports, NULL);
+	/* msm sends at most 10 bpc */
+	u32 bpc = min_t(u32, info->bpc ?: 8, 10);
+
+	if (port_bpc > 0)
+		bpc = min_t(u32, bpc, port_bpc);
+
+	if (tmds > 0 && bpc > 8) {
+		if (info->max_tmds_clock)
+			tmds = min(tmds, info->max_tmds_clock);
+		if (clock * bpc / 8 > tmds ||
+		    (info->is_hdmi && !(info->edid_hdmi_rgb444_dc_modes & DRM_EDID_HDMI_DC_30)))
+			bpc = 8;
+	}
+
+	return bpc;
+}
+
 static int msm_dp_display_set_mode(struct msm_dp *msm_dp_display,
 				   const struct drm_display_mode *adjusted_mode,
 				   struct msm_dp_panel *msm_dp_panel)
@@ -708,7 +792,8 @@ static int msm_dp_display_set_mode(struct msm_dp *msm_dp_display,
 	if (msm_dp_display_check_video_test(msm_dp_display))
 		bpp = msm_dp_display_get_test_bpp(msm_dp_display);
 	else
-		bpp = msm_dp_panel->connector->display_info.bpc * 3;
+		bpp = msm_dp_display_max_bpc(dp, &msm_dp_panel->connector->display_info,
+					     adjusted_mode->clock) * 3;
 
 	msm_dp_panel_init_panel_info(msm_dp_panel, adjusted_mode, bpp ? bpp : 24);
 
@@ -769,6 +854,14 @@ static int msm_dp_display_enable(struct msm_dp_display_private *dp,
 	drm_dbg_dp(dp->drm_dev, "sink_count=%d\n", dp->link->sink_count);
 
 	rc = msm_dp_ctrl_on_stream(dp->ctrl, msm_dp_panel, msm_dp_display->mst_active);
+	/*
+	 * A stream that never started must not count as active: disabling it
+	 * would push idle a link that is not running, which resets glymur.
+	 */
+	if (rc) {
+		msm_dp_ctrl_off_pixel_clk(dp->ctrl, msm_dp_panel->stream_id);
+		return rc;
+	}
 
 	msm_dp_display->active_stream_cnt++;
 
@@ -857,11 +950,13 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 					       const struct drm_display_info *info,
 					       const struct drm_display_mode *mode)
 {
-	const u32 num_components = 3, default_bpp = 24;
+	const u32 num_components = 3;
 	struct msm_dp_display_private *msm_dp_display;
 	struct msm_dp_link_info *link_info;
 	u32 mode_rate_khz = 0, supported_rate_khz = 0, mode_bpp = 0;
 	int mode_pclk_khz = mode->clock;
+	int link_pclk_khz, tmds_khz;
+	bool is_yuv_420;
 
 	if (!dp || !mode_pclk_khz || !dp->connector) {
 		DRM_ERROR("invalid params\n");
@@ -871,22 +966,30 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
 	link_info = &msm_dp_display->panel->link_info;
 
-	if ((drm_mode_is_420_only(&dp->connector->display_info, mode) &&
-	     msm_dp_display->panel->vsc_sdp_supported) ||
-	     msm_dp_wide_bus_available(dp))
+	is_yuv_420 = drm_mode_is_420_only(&dp->connector->display_info, mode) &&
+		     msm_dp_display->panel->vsc_sdp_supported;
+
+	link_pclk_khz = is_yuv_420 ? mode_pclk_khz / 2 : mode_pclk_khz;
+
+	if (is_yuv_420 || msm_dp_wide_bus_available(dp))
 		mode_pclk_khz /= 2;
 
 	if (mode_pclk_khz > DP_MAX_PIXEL_CLK_KHZ)
 		return MODE_CLOCK_HIGH;
 
-	mode_bpp = dp->connector->display_info.bpc * num_components;
-	if (!mode_bpp)
-		mode_bpp = default_bpp;
+	/* A DP-to-HDMI or DVI converter must be able to send the mode at 8 bpc. */
+	tmds_khz = drm_dp_downstream_max_tmds_clock(msm_dp_display->panel->dpcd,
+						    msm_dp_display->panel->downstream_ports, NULL);
+	if (tmds_khz > 0 && link_pclk_khz > tmds_khz)
+		return MODE_CLOCK_HIGH;
+
+	mode_bpp = msm_dp_display_max_bpc(msm_dp_display, &dp->connector->display_info,
+					  link_pclk_khz) * num_components;
 
 	mode_bpp = msm_dp_panel_get_mode_bpp(msm_dp_display->panel,
-			mode_bpp, mode_pclk_khz);
+			mode_bpp, link_pclk_khz);
 
-	mode_rate_khz = mode_pclk_khz * mode_bpp;
+	mode_rate_khz = link_pclk_khz * mode_bpp;
 	supported_rate_khz = link_info->num_lanes * link_info->rate * 8;
 
 	if (mode_rate_khz > supported_rate_khz)
@@ -898,6 +1001,7 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
 int msm_dp_display_get_modes(struct msm_dp *dp)
 {
 	struct msm_dp_display_private *msm_dp_display;
+	struct drm_connector *connector;
 
 	if (!dp) {
 		DRM_ERROR("invalid params\n");
@@ -905,8 +1009,22 @@ int msm_dp_display_get_modes(struct msm_dp *dp)
 	}
 
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+	connector = msm_dp_display->panel->connector;
 
-	return drm_edid_connector_add_modes(msm_dp_display->panel->connector);
+	/*
+	 * The EDID is read once at HPD, which a slow sink or adaptor can fail.
+	 * Read it again on a later probe instead of waiting for a replug.
+	 */
+	if (!dp->is_edp && !connector->edid_blob_ptr) {
+		const struct drm_edid *drm_edid;
+
+		drm_edid = drm_edid_read_ddc(connector, &msm_dp_display->aux->ddc);
+		if (drm_edid)
+			drm_edid_connector_update(connector, drm_edid);
+		drm_edid_free(drm_edid);
+	}
+
+	return drm_edid_connector_add_modes(connector);
 }
 
 bool msm_dp_display_check_video_test(struct msm_dp *dp)
@@ -1028,32 +1146,41 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
 
 	phy_deinit = msm_dp_display_host_phy_init(priv);
 
+	if (priv->plugged && priv->sink_unresponsive)
+		goto end;
+
 	msm_dp_aux_enable_xfers(priv->aux, true);
 
+	/*
+	 * Only report what the sink answers. The plug and unplug handlers own
+	 * ->plugged and the reference that keeps a plugged controller on, so a
+	 * read that fails while a dock or adaptor brings its sink up cannot
+	 * unplug it.
+	 */
 	ret = msm_dp_aux_is_link_connected(priv->aux);
 	DRM_DEBUG_DP("aux link status: %x\n", ret);
 	if (!priv->plugged && !ret) {
 		DRM_DEBUG_DP("aux not connected\n");
-		priv->plugged = false;
 		goto end;
 	}
 
 	ret = drm_dp_read_dpcd_caps(priv->aux, dpcd);
 	if (ret) {
 		DRM_DEBUG_DP("failed to read caps\n");
-		priv->plugged = false;
+		if (priv->plugged)
+			msm_dp_display_sink_unresponsive(priv);
 		goto end;
 	}
 
 	ret = drm_dp_read_desc(priv->aux, &desc, drm_dp_is_branch(dpcd));
 	if (ret) {
 		DRM_DEBUG_DP("failed to read desc\n");
-		priv->plugged = false;
+		if (priv->plugged)
+			msm_dp_display_sink_unresponsive(priv);
 		goto end;
 	}
 
 	status = connector_status_connected;
-	priv->plugged = true;
 
 	if (drm_dp_read_sink_count_cap(connector, dpcd, &desc)) {
 		int sink_count = drm_dp_read_sink_count(priv->aux);
@@ -1069,18 +1196,12 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
 		status = connector_status_disconnected;
 
 end:
-	/*
-	 * If we detected the DPRX, leave the controller on so that it doesn't
-	 * lose the state.
-	 */
-	if (!priv->plugged) {
-		if (phy_deinit) {
-			msm_dp_aux_enable_xfers(priv->aux, false);
-			msm_dp_display_host_phy_exit(priv);
-		}
-
-		pm_runtime_put_sync(&dp->pdev->dev);
+	if (!priv->plugged && phy_deinit) {
+		msm_dp_aux_enable_xfers(priv->aux, false);
+		msm_dp_display_host_phy_exit(priv);
 	}
+
+	pm_runtime_put_sync(&dp->pdev->dev);
 
 	return status;
 }
@@ -1532,6 +1653,37 @@ bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
 	return dp->wide_bus_supported;
 }
 
+/**
+ * msm_dp_mode_bpc() - bits per colour component @mode goes out with
+ * @msm_dp_display: DP display
+ * @mode: the mode, as the encoder has it
+ *
+ * The link can carry fewer bits than the sink takes, and the mode then goes out
+ * at 6 bpc, which needs dithering. This is what the bridge picks when it enables
+ * the mode, after the encoder.
+ *
+ * Returns: the bpc, or 0 when unknown (MST, a video test pattern).
+ */
+unsigned int msm_dp_mode_bpc(struct msm_dp *msm_dp_display, const struct drm_display_mode *mode)
+{
+	struct msm_dp_display_private *dp;
+	u32 bpp;
+
+	if (!msm_dp_display || !msm_dp_display->connector || msm_dp_display->mst_active)
+		return 0;
+
+	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+	if (dp->panel->video_test)
+		return 0;
+
+	bpp = msm_dp_panel_get_mode_bpp(dp->panel,
+			msm_dp_display_max_bpc(dp, &msm_dp_display->connector->display_info,
+					       mode->clock) * 3,
+			mode->clock);
+
+	return bpp / 3;
+}
+
 void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *root, bool is_edp)
 {
 	struct msm_dp_display_private *dp;
@@ -1631,8 +1783,10 @@ void msm_dp_display_enable_helper(struct msm_dp *msm_dp_display, struct msm_dp_p
 
 	if (msm_dp_display->link_ready) {
 		rc = msm_dp_display_enable(dp, msm_dp_panel);
-		if (rc)
+		if (rc) {
 			DRM_ERROR("DP display enable failed, rc=%d\n", rc);
+			return;
+		}
 
 		rc = msm_dp_display_post_enable(msm_dp_display);
 		if (rc) {
@@ -1797,9 +1951,39 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
 	drm_dbg_dp(dp->drm_dev, "type=%d link hpd_link_status=0x%x, status=%d\n",
 		   msm_dp_display->connector_type, hpd_link_status, status);
 
-	if (extra_status == DRM_CONNECTOR_DP_IRQ_HPD ||
+	/*
+	 * A connector probe passes on what detect() read and has no hotplug to
+	 * send. Only HPD unplugs a sink or sets it up again: a probe racing an
+	 * adaptor that is bringing its sink up can read nothing, and unplugging
+	 * on that took the link down under the modeset that followed. A probe
+	 * still sets up a sink that no HPD event announced.
+	 */
+	if (!send_hotplug && extra_status == DRM_CONNECTOR_NO_EXTRA_STATUS) {
+		if (status == connector_status_connected && !dp->plugged)
+			msm_dp_hpd_plug_handle(dp);
+	} else if (extra_status == DRM_CONNECTOR_DP_IRQ_HPD ||
 	    hpd_link_status == ISR_IRQ_HPD_PULSE_COUNT) {
-		msm_dp_irq_hpd_handle(dp);
+		/*
+		 * A sink raises IRQ_HPD only with HPD high, and pmic_glink_altmode
+		 * reports a notification carrying both as the IRQ alone, so a dock
+		 * can announce itself with one. A sink that is not set up, or did
+		 * not answer when it was, is set up instead of serviced.
+		 */
+		bool set_up = msm_dp_display->is_edp ||
+			      (dp->plugged && !dp->sink_unresponsive);
+		bool ds_port_changed = false;
+
+		if (set_up)
+			msm_dp_irq_hpd_handle(dp, &ds_port_changed);
+		else
+			msm_dp_hpd_plug_handle(dp);
+
+		/*
+		 * An IRQ-only notification sends no hotplug event, and a dock reports
+		 * a monitor plugged into it or unplugged with IRQ_HPD alone.
+		 */
+		if (!send_hotplug && !msm_dp_display->is_edp && (!set_up || ds_port_changed))
+			drm_kms_helper_connector_hotplug_event(connector);
 	} else if (status == connector_status_connected) {
 		if (hpd_link_status == ISR_HPD_REPLUG_COUNT) {
 			msm_dp_hpd_unplug_handle(dp);
