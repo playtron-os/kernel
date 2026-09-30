@@ -766,8 +766,15 @@ static u32 msm_dp_display_max_bpc(struct msm_dp_display_private *dp,
 	/* msm sends at most 10 bpc */
 	u32 bpc = min_t(u32, info->bpc ?: 8, 10);
 
+	/*
+	 * An HDMI display is always behind a converter, reported or not. One that reports no
+	 * downstream port passes the display's deep colour on in the EDID while often carrying
+	 * only HDMI 1.4 clocks, so stay at 8 bpc unless the converter says it carries more.
+	 */
 	if (port_bpc > 0)
 		bpc = min_t(u32, bpc, port_bpc);
+	else if (info->is_hdmi)
+		bpc = min_t(u32, bpc, 8);
 
 	if (tmds > 0 && bpc > 8) {
 		if (info->max_tmds_clock)
