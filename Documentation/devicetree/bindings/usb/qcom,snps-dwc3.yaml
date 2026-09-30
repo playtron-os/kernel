@@ -153,6 +153,12 @@ properties:
       HS/FS/LS modes are supported.
     type: boolean
 
+  mode-switch:
+    description:
+      The controller takes USB Type-C pin assignments, to run its pipe domain
+      on the UTMI clock while all lanes of the port carry DisplayPort.
+    type: boolean
+
   wakeup-source: true
 
 required:
