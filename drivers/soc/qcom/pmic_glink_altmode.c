@@ -120,6 +120,7 @@ struct pmic_glink_altmode_port {
 	u8 hpd_state;
 	u8 hpd_irq;
 	u8 mux_ctrl;
+	bool hpd_announced;
 };
 
 #define work_to_altmode(w) container_of((w), struct pmic_glink_altmode, enable_work)
@@ -351,6 +352,10 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 	struct pmic_glink_altmode *altmode = alt_port->altmode;
 	enum drm_connector_status conn_status;
 
+	dev_dbg(altmode->dev, "port %u: svid %#06x mux %u mode %u orientation %d hpd %u irq %u\n",
+		alt_port->index, alt_port->svid, alt_port->mux_ctrl, alt_port->mode,
+		alt_port->orientation, alt_port->hpd_state, alt_port->hpd_irq);
+
 	typec_switch_set(alt_port->typec_switch, alt_port->orientation);
 
 	/*
@@ -373,7 +378,16 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 		else
 			conn_status = connector_status_disconnected;
 
+		/*
+		 * A dock can raise HPD and IRQ_HPD in one notification, or this work
+		 * can run only for the IRQ that followed a plain HPD high. The IRQ
+		 * reports no level, so announce the sink before its first one.
+		 */
 		if (alt_port->hpd_irq) {
+			if (alt_port->hpd_state && !alt_port->hpd_announced)
+				drm_aux_hpd_bridge_notify_extra(&alt_port->bridge->dev,
+								connector_status_connected,
+								DRM_CONNECTOR_NO_EXTRA_STATUS);
 			drm_aux_hpd_bridge_notify_extra(&alt_port->bridge->dev,
 							connector_status_unknown,
 							DRM_CONNECTOR_DP_IRQ_HPD);
@@ -382,6 +396,7 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 							conn_status,
 							DRM_CONNECTOR_NO_EXTRA_STATUS);
 		}
+		alt_port->hpd_announced = alt_port->hpd_state;
 	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
 		if (alt_port->svid == USB_TYPEC_TBT_SID)
 			pmic_glink_altmode_enable_tbt(altmode, alt_port);
@@ -396,6 +411,10 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 			alt_port->mux_ctrl, alt_port->index);
 		pmic_glink_altmode_safe(altmode, alt_port);
 	}
+
+	/* Out of DP alt mode, the next entry announces its sink again */
+	if (alt_port->svid != USB_TYPEC_DP_SID)
+		alt_port->hpd_announced = false;
 
 	pmic_glink_altmode_request(altmode, ALTMODE_PAN_ACK, alt_port->index);
 }
